@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <Preferences.h>
+#include <string.h>
 #include "web_ui.h"
 
 static const char* AP_SSID = "esp32-garden-1";
@@ -14,6 +16,10 @@ static const uint32_t SERIAL_BAUD = 115200;
 static const uint8_t PUMP_COUNT = 16;
 static const uint8_t PUMP_NAME_MAX = 24;
 
+static const uint32_t STORE_MAGIC = 0x47445231UL;  // "GDR1"
+static const uint16_t STORE_VERSION = 1;
+static const uint32_t NVS_AUTOSAVE_SEC = 300;  // snapshot countdowns every 5 min
+
 // Active LOW: LOW = relay ON, HIGH = relay OFF (typical modules).
 static const bool RELAY_ACTIVE_LOW = true;
 
@@ -25,28 +31,132 @@ static const uint8_t RELAY_PINS[PUMP_COUNT] = {
 
 WebServer server(80);
 DNSServer dnsServer;
+Preferences prefs;
 
 struct PumpConfig {
   char name[PUMP_NAME_MAX];
   bool enabled;
   uint16_t durationSec;
-  uint16_t intervalHours;  // typical: 48 = every 2 days
+  uint16_t intervalHours;   // typical: 48 = every 2 days
+  uint32_t dueInSec;        // countdown to next auto water (frozen when disabled)
+  uint32_t wateredAgoSec;   // seconds since last water (UINT32_MAX = never)
+};
+
+struct PersistedState {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t pumpCount;
+  PumpConfig pumps[PUMP_COUNT];
+  int8_t lastWateredIndex;
+  uint8_t reserved[3];
 };
 
 PumpConfig pumps[PUMP_COUNT];
 int8_t lastWateredIndex = -1;
-uint32_t lastWateredAtMs = 0;
 
 int8_t activePump = -1;
 uint32_t waterUntilMs = 0;
 
-void initPumps() {
+bool configDirty = false;
+uint32_t lastTickMs = 0;
+uint32_t secSinceNvsSave = 0;
+
+uint32_t intervalToSec(uint16_t intervalHours) {
+  return (uint32_t)intervalHours * 3600UL;
+}
+
+void markDirty() {
+  configDirty = true;
+}
+
+void initPumpsDefaults() {
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
     snprintf(pumps[i].name, PUMP_NAME_MAX, "Насос %u", i + 1);
     pumps[i].enabled = false;
     pumps[i].durationSec = 30;
-    pumps[i].intervalHours = 48;  // once every 2 days
+    pumps[i].intervalHours = 48;
+    pumps[i].dueInSec = intervalToSec(pumps[i].intervalHours);
+    pumps[i].wateredAgoSec = UINT32_MAX;
   }
+  lastWateredIndex = -1;
+}
+
+bool saveStateToNvs() {
+  PersistedState st;
+  memset(&st, 0, sizeof(st));
+  st.magic = STORE_MAGIC;
+  st.version = STORE_VERSION;
+  st.pumpCount = PUMP_COUNT;
+  memcpy(st.pumps, pumps, sizeof(pumps));
+  st.lastWateredIndex = lastWateredIndex;
+
+  bool ok = prefs.putBytes("state", &st, sizeof(st)) == sizeof(st);
+  if (ok) {
+    configDirty = false;
+    secSinceNvsSave = 0;
+    Serial.println("[nvs] state saved");
+  } else {
+    Serial.println("[nvs] save FAILED");
+  }
+  return ok;
+}
+
+bool loadStateFromNvs() {
+  size_t len = prefs.getBytesLength("state");
+  if (len != sizeof(PersistedState)) {
+    Serial.print("[nvs] no valid state (len=");
+    Serial.print(len);
+    Serial.println("), using defaults");
+    return false;
+  }
+
+  PersistedState st;
+  if (prefs.getBytes("state", &st, sizeof(st)) != sizeof(st)) {
+    Serial.println("[nvs] read failed");
+    return false;
+  }
+  if (st.magic != STORE_MAGIC || st.version != STORE_VERSION || st.pumpCount != PUMP_COUNT) {
+    Serial.println("[nvs] magic/version mismatch, using defaults");
+    return false;
+  }
+
+  memcpy(pumps, st.pumps, sizeof(pumps));
+  lastWateredIndex = st.lastWateredIndex;
+  if (lastWateredIndex < -1 || lastWateredIndex >= (int8_t)PUMP_COUNT) {
+    lastWateredIndex = -1;
+  }
+
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    pumps[i].name[PUMP_NAME_MAX - 1] = '\0';
+    if (pumps[i].durationSec < 1) pumps[i].durationSec = 1;
+    if (pumps[i].durationSec > 3600) pumps[i].durationSec = 3600;
+    if (pumps[i].intervalHours < 1) pumps[i].intervalHours = 1;
+    if (pumps[i].intervalHours > 8760) pumps[i].intervalHours = 8760;
+    uint32_t maxDue = intervalToSec(pumps[i].intervalHours);
+    if (pumps[i].dueInSec > maxDue) pumps[i].dueInSec = maxDue;
+  }
+
+  Serial.println("[nvs] state loaded");
+  return true;
+}
+
+void saveStateIfNeeded(bool force) {
+  if (force) {
+    saveStateToNvs();
+    return;
+  }
+  // Periodic snapshot so dueInSec / wateredAgo survive reboot (without wearing NVS every second).
+  if (secSinceNvsSave >= NVS_AUTOSAVE_SEC) {
+    saveStateToNvs();
+  }
+}
+
+void resetPumpSchedule(uint8_t index) {
+  if (index >= PUMP_COUNT) return;
+  pumps[index].dueInSec = intervalToSec(pumps[index].intervalHours);
+  pumps[index].wateredAgoSec = 0;
+  lastWateredIndex = (int8_t)index;
+  markDirty();
 }
 
 void relayWrite(uint8_t index, bool on) {
@@ -121,8 +231,7 @@ bool startWater(uint8_t pump) {
 
   activePump = (int8_t)pump;
   waterUntilMs = millis() + (uint32_t)pumps[pump].durationSec * 1000UL;
-  lastWateredIndex = (int8_t)pump;
-  lastWateredAtMs = millis();
+  resetPumpSchedule(pump);
 
   Serial.print("[water] start pump=");
   Serial.print(pump);
@@ -137,6 +246,56 @@ void updateWatering() {
   if (!isWateringActive()) return;
   if ((int32_t)(millis() - waterUntilMs) >= 0) {
     stopWatering();
+  }
+}
+
+// Tick once per second: countdowns, auto schedule, NVS autosave.
+void updateScheduleTick() {
+  uint32_t now = millis();
+  if (lastTickMs == 0) {
+    lastTickMs = now;
+    return;
+  }
+  while ((int32_t)(now - lastTickMs) >= 1000) {
+    lastTickMs += 1000;
+    secSinceNvsSave++;
+
+    for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+      if (pumps[i].wateredAgoSec != UINT32_MAX && pumps[i].wateredAgoSec < UINT32_MAX - 1) {
+        pumps[i].wateredAgoSec++;
+      }
+      if (!pumps[i].enabled) continue;
+      if (pumps[i].dueInSec > 0) {
+        pumps[i].dueInSec--;
+      }
+    }
+
+    // Start the most overdue enabled pump when idle.
+    if (!isWateringActive()) {
+      int8_t best = -1;
+      uint32_t bestOverdue = 0;
+      for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+        if (!pumps[i].enabled) continue;
+        if (pumps[i].dueInSec > 0) continue;
+        // Overdue score: prefer longest-waiting (highest wateredAgo, or never).
+        uint32_t overdue = (pumps[i].wateredAgoSec == UINT32_MAX)
+                               ? UINT32_MAX
+                               : pumps[i].wateredAgoSec;
+        if (best < 0 || overdue >= bestOverdue) {
+          best = (int8_t)i;
+          bestOverdue = overdue;
+        }
+      }
+      if (best >= 0) {
+        Serial.print("[schedule] auto water pump=");
+        Serial.println(best);
+        if (startWater((uint8_t)best)) {
+          saveStateToNvs();
+        }
+      }
+    }
+
+    saveStateIfNeeded(false);
   }
 }
 
@@ -169,6 +328,14 @@ String pumpsToJson() {
     json += String(pumps[i].durationSec);
     json += ",\"intervalHours\":";
     json += String(pumps[i].intervalHours);
+    json += ",\"dueInSec\":";
+    json += String(pumps[i].dueInSec);
+    json += ",\"wateredAgoSec\":";
+    if (pumps[i].wateredAgoSec == UINT32_MAX) {
+      json += "null";
+    } else {
+      json += String(pumps[i].wateredAgoSec);
+    }
     json += '}';
   }
   json += ']';
@@ -179,13 +346,16 @@ String lastWateredToJson() {
   if (lastWateredIndex < 0 || lastWateredIndex >= PUMP_COUNT) {
     return "null";
   }
-  uint32_t agoSec = (millis() - lastWateredAtMs) / 1000UL;
+  uint8_t i = (uint8_t)lastWateredIndex;
+  if (pumps[i].wateredAgoSec == UINT32_MAX) {
+    return "null";
+  }
   String json = "{";
   json += "\"index\":";
   json += String(lastWateredIndex);
-  json += ",\"name\":\"" + jsonEscape(String(pumps[lastWateredIndex].name)) + "\",";
+  json += ",\"name\":\"" + jsonEscape(String(pumps[i].name)) + "\",";
   json += "\"agoSec\":";
-  json += String(agoSec);
+  json += String(pumps[i].wateredAgoSec);
   json += '}';
   return json;
 }
@@ -292,6 +462,9 @@ void handleConfig() {
     if (objEnd < 0) break;
     String obj = body.substring(objStart, objEnd + 1);
 
+    bool wasEnabled = pumps[i].enabled;
+    uint16_t oldInterval = pumps[i].intervalHours;
+
     char newName[PUMP_NAME_MAX];
     if (extractQuotedString(obj, "name", newName, PUMP_NAME_MAX)) {
       strncpy(pumps[i].name, newName, PUMP_NAME_MAX - 1);
@@ -305,9 +478,20 @@ void handleConfig() {
     if (duration < 1) duration = 1;
     if (duration > 3600) duration = 3600;
     if (interval < 1) interval = 1;
-    if (interval > 8760) interval = 8760;  // up to 1 year
+    if (interval > 8760) interval = 8760;
     pumps[i].durationSec = (uint16_t)duration;
     pumps[i].intervalHours = (uint16_t)interval;
+
+    uint32_t newIntervalSec = intervalToSec(pumps[i].intervalHours);
+
+    // Newly enabled: wait a full interval before first auto water.
+    if (!wasEnabled && pumps[i].enabled) {
+      pumps[i].dueInSec = newIntervalSec;
+    } else if (pumps[i].intervalHours != oldInterval) {
+      if (pumps[i].dueInSec > newIntervalSec) {
+        pumps[i].dueInSec = newIntervalSec;
+      }
+    }
 
     Serial.print("[config] pump ");
     Serial.print(i);
@@ -316,12 +500,19 @@ void handleConfig() {
     Serial.print(" duration=");
     Serial.print(pumps[i].durationSec);
     Serial.print(" intervalH=");
-    Serial.println(pumps[i].intervalHours);
+    Serial.print(pumps[i].intervalHours);
+    Serial.print(" dueInSec=");
+    Serial.println(pumps[i].dueInSec);
 
     searchFrom = objEnd + 1;
   }
 
-  String resp = "{\"ok\":true,\"message\":\"Saved (RAM)\",\"lastWatered\":";
+  markDirty();
+  bool saved = saveStateToNvs();
+
+  String resp = "{\"ok\":true,\"message\":\"";
+  resp += saved ? "Сохранено" : "Сохранено (NVS ошибка)";
+  resp += "\",\"lastWatered\":";
   resp += lastWateredToJson();
   resp += ",\"watering\":";
   resp += wateringToJson();
@@ -371,6 +562,8 @@ void handleWater() {
     return;
   }
 
+  saveStateToNvs();
+
   String resp = "{\"ok\":true,\"message\":\"Watering pump ";
   resp += String(pump + 1);
   resp += "\",\"pump\":";
@@ -382,6 +575,8 @@ void handleWater() {
   resp += wateringToJson();
   resp += ",\"lastWatered\":";
   resp += lastWateredToJson();
+  resp += ",\"pumps\":";
+  resp += pumpsToJson();
   resp += '}';
   server.send(200, "application/json; charset=utf-8", resp);
 }
@@ -409,6 +604,7 @@ void printBanner(bool apOk) {
   Serial.println(PUMP_COUNT);
   Serial.print(" Relay: ");
   Serial.println(RELAY_ACTIVE_LOW ? "Active LOW" : "Active HIGH");
+  Serial.println(" Schedule: auto by dueInSec + NVS");
   Serial.println(" Open in browser:");
   Serial.println("   http://192.168.4.1");
   Serial.println(" (use http, not https)");
@@ -428,7 +624,9 @@ void setup() {
   Serial.print("[boot] Set Serial Monitor baud to ");
   Serial.println(SERIAL_BAUD);
 
-  initPumps();
+  initPumpsDefaults();
+  prefs.begin("garden", false);
+  loadStateFromNvs();
   initRelays();
 
   WiFi.persistent(false);
@@ -453,6 +651,7 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
+  lastTickMs = millis();
   printBanner(apOk);
 }
 
@@ -460,4 +659,5 @@ void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
   updateWatering();
+  updateScheduleTick();
 }

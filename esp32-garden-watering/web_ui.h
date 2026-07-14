@@ -263,6 +263,20 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
       return days + ' дн назад';
     }
 
+    function formatDue(sec) {
+      if (sec == null || sec < 0) return '—';
+      if (sec === 0) return 'сейчас / в очереди';
+      if (sec < 60) return sec + ' с';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return min + ' мин';
+      const hours = Math.floor(min / 60);
+      const remMin = min % 60;
+      if (hours < 48) return remMin ? (hours + ' ч ' + remMin + ' мин') : (hours + ' ч');
+      const days = Math.floor(hours / 24);
+      const remH = hours % 24;
+      return remH ? (days + ' дн ' + remH + ' ч') : (days + ' дн');
+    }
+
     function renderLastWatered() {
       const nameEl = document.getElementById('lastWaterName');
       const agoEl = document.getElementById('lastWaterAgo');
@@ -316,6 +330,11 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
               <input type="number" min="1" max="8760" data-field="intervalHours" value="${Number(p.intervalHours) || 48}">
             </label>
           </div>
+          <div class="ago" style="margin:0 0 0.65rem;font-size:0.85rem;color:var(--muted)">
+            ${p.enabled
+              ? ('Автополив через: <strong style="color:var(--ink);font-weight:600">' + formatDue(Number(p.dueInSec) || 0) + '</strong>')
+              : 'Автополив выключен'}
+          </div>
           <button type="button" class="ghost" data-water="${i}" ${watering && watering.active ? 'disabled' : ''}>Полить сейчас</button>
         </section>
       `).join('');
@@ -355,6 +374,19 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
         pumpsEl.querySelectorAll('[data-water]').forEach(btn => {
           btn.disabled = !!(watering && watering.active);
         });
+        // Refresh due labels without wiping inputs the user may be editing.
+        pumpsEl.querySelectorAll('.pump').forEach((section, i) => {
+          const dueEl = section.querySelector('.ago');
+          if (!dueEl || !pumps[i]) return;
+          if (section.querySelector('[data-field="name"]') === document.activeElement
+              || section.querySelector('[data-field="durationSec"]') === document.activeElement
+              || section.querySelector('[data-field="intervalHours"]') === document.activeElement) {
+            return;
+          }
+          dueEl.innerHTML = pumps[i].enabled
+            ? ('Автополив через: <strong style="color:var(--ink);font-weight:600">' + formatDue(Number(pumps[i].dueInSec) || 0) + '</strong>')
+            : 'Автополив выключен';
+        });
       }
     }
 
@@ -382,6 +414,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
         const data = await res.json();
         if (data.watering) watering = data.watering;
         if (data.lastWatered) lastWatered = data.lastWatered;
+        if (Array.isArray(data.pumps)) pumps = data.pumps;
         renderLastWatered();
         renderWatering();
         renderPumps();
