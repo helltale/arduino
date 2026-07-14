@@ -219,6 +219,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
       <div>AP: <strong id="ap">—</strong></div>
       <div>IP: <strong id="ip">—</strong></div>
       <div>Сервер: <strong id="alive">загрузка…</strong></div>
+      <div>Полив: <strong id="watering">—</strong></div>
     </div>
 
     <form id="configForm">
@@ -236,6 +237,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
     const form = document.getElementById('configForm');
     let pumps = [];
     let lastWatered = null;
+    let watering = { active: false, pump: null, remainSec: 0 };
 
     function escapeHtml(s) {
       return String(s)
@@ -274,6 +276,20 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
       agoEl.textContent = formatAgo(lastWatered.agoSec);
     }
 
+    function renderWatering() {
+      const el = document.getElementById('watering');
+      if (!watering || !watering.active) {
+        el.textContent = 'нет';
+        return;
+      }
+      const idx = Number(watering.pump);
+      const name = (pumps[idx] && pumps[idx].name)
+        ? pumps[idx].name
+        : ('Насос ' + (idx + 1));
+      const remain = Number(watering.remainSec) || 0;
+      el.textContent = (idx + 1) + '. ' + name + ' · ещё ' + remain + ' с';
+    }
+
     function renderPumps() {
       pumpsEl.innerHTML = pumps.map((p, i) => `
         <section class="pump" data-i="${i}">
@@ -300,7 +316,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
               <input type="number" min="1" max="8760" data-field="intervalHours" value="${Number(p.intervalHours) || 48}">
             </label>
           </div>
-          <button type="button" class="ghost" data-water="${i}">Полить сейчас</button>
+          <button type="button" class="ghost" data-water="${i}" ${watering && watering.active ? 'disabled' : ''}>Полить сейчас</button>
         </section>
       `).join('');
 
@@ -320,14 +336,26 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
       });
     }
 
-    function applyStatus(data) {
+    function applyStatus(data, forcePumps) {
       document.getElementById('ap').textContent = data.apSsid || '—';
       document.getElementById('ip').textContent = data.ip || '—';
       document.getElementById('alive').textContent = 'онлайн · uptime ' + (data.uptimeSec || 0) + ' с';
-      pumps = Array.isArray(data.pumps) ? data.pumps : [];
+      const nextPumps = Array.isArray(data.pumps) ? data.pumps : [];
+      const needRenderPumps = forcePumps
+        || pumps.length !== nextPumps.length
+        || pumpsEl.children.length !== nextPumps.length;
+      pumps = nextPumps;
       lastWatered = data.lastWatered || null;
+      watering = data.watering || { active: false, pump: null, remainSec: 0 };
       renderLastWatered();
-      renderPumps();
+      renderWatering();
+      if (needRenderPumps) {
+        renderPumps();
+      } else {
+        pumpsEl.querySelectorAll('[data-water]').forEach(btn => {
+          btn.disabled = !!(watering && watering.active);
+        });
+      }
     }
 
     async function loadStatus() {
@@ -352,11 +380,17 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
           body
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.message || 'Ошибка');
-        if (data.lastWatered) {
-          lastWatered = data.lastWatered;
-          renderLastWatered();
+        if (data.watering) watering = data.watering;
+        if (data.lastWatered) lastWatered = data.lastWatered;
+        renderLastWatered();
+        renderWatering();
+        renderPumps();
+        if (res.status === 409 || data.message === 'busy') {
+          const remain = watering && watering.remainSec != null ? watering.remainSec : 0;
+          setMsg('Занято: уже идёт полив' + (remain ? (' · ещё ' + remain + ' с') : ''), true);
+          return;
         }
+        if (!res.ok || !data.ok) throw new Error(data.message || 'Ошибка');
         setMsg(data.message || 'Полив запрошен');
       } catch (e) {
         setMsg(e.message || 'Ошибка полива', true);
@@ -390,7 +424,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
     });
 
     loadStatus();
-    setInterval(loadStatus, 15000);
+    setInterval(loadStatus, 2000);
   </script>
 </body>
 </html>

@@ -11,8 +11,17 @@ static const IPAddress AP_GW(192, 168, 4, 1);
 static const IPAddress AP_MASK(255, 255, 255, 0);
 
 static const uint32_t SERIAL_BAUD = 115200;
-static const uint8_t PUMP_COUNT = 14;
+static const uint8_t PUMP_COUNT = 16;
 static const uint8_t PUMP_NAME_MAX = 24;
+
+// Active LOW: LOW = relay ON, HIGH = relay OFF (typical modules).
+static const bool RELAY_ACTIVE_LOW = true;
+
+// Module 1: IN1..IN8, Module 2: IN1..IN8
+static const uint8_t RELAY_PINS[PUMP_COUNT] = {
+  13, 12, 14, 27, 26, 25, 33, 32,
+  4, 16, 17, 5, 18, 19, 21, 22
+};
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -28,12 +37,106 @@ PumpConfig pumps[PUMP_COUNT];
 int8_t lastWateredIndex = -1;
 uint32_t lastWateredAtMs = 0;
 
+int8_t activePump = -1;
+uint32_t waterUntilMs = 0;
+
 void initPumps() {
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
     snprintf(pumps[i].name, PUMP_NAME_MAX, "Насос %u", i + 1);
     pumps[i].enabled = false;
     pumps[i].durationSec = 30;
     pumps[i].intervalHours = 48;  // once every 2 days
+  }
+}
+
+void relayWrite(uint8_t index, bool on) {
+  if (index >= PUMP_COUNT) return;
+  uint8_t level;
+  if (RELAY_ACTIVE_LOW) {
+    level = on ? LOW : HIGH;
+  } else {
+    level = on ? HIGH : LOW;
+  }
+  digitalWrite(RELAY_PINS[index], level);
+}
+
+void allRelaysOff() {
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    relayWrite(i, false);
+  }
+}
+
+void initRelays() {
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+  }
+  allRelaysOff();
+  activePump = -1;
+  waterUntilMs = 0;
+}
+
+bool isWateringActive() {
+  return activePump >= 0 && activePump < PUMP_COUNT;
+}
+
+uint32_t wateringRemainSec() {
+  if (!isWateringActive()) return 0;
+  uint32_t now = millis();
+  if ((int32_t)(waterUntilMs - now) <= 0) return 0;
+  return (waterUntilMs - now + 999UL) / 1000UL;
+}
+
+String wateringToJson() {
+  String json = "{";
+  json += "\"active\":";
+  json += isWateringActive() ? "true" : "false";
+  json += ",\"pump\":";
+  if (isWateringActive()) {
+    json += String(activePump);
+  } else {
+    json += "null";
+  }
+  json += ",\"remainSec\":";
+  json += String(wateringRemainSec());
+  json += '}';
+  return json;
+}
+
+void stopWatering() {
+  if (isWateringActive()) {
+    Serial.print("[water] stop pump=");
+    Serial.println(activePump);
+    relayWrite((uint8_t)activePump, false);
+  }
+  activePump = -1;
+  waterUntilMs = 0;
+}
+
+bool startWater(uint8_t pump) {
+  if (pump >= PUMP_COUNT) return false;
+  if (isWateringActive()) return false;
+
+  allRelaysOff();
+  relayWrite(pump, true);
+
+  activePump = (int8_t)pump;
+  waterUntilMs = millis() + (uint32_t)pumps[pump].durationSec * 1000UL;
+  lastWateredIndex = (int8_t)pump;
+  lastWateredAtMs = millis();
+
+  Serial.print("[water] start pump=");
+  Serial.print(pump);
+  Serial.print(" pin=");
+  Serial.print(RELAY_PINS[pump]);
+  Serial.print(" sec=");
+  Serial.println(pumps[pump].durationSec);
+  return true;
+}
+
+void updateWatering() {
+  if (!isWateringActive()) return;
+  if ((int32_t)(millis() - waterUntilMs) >= 0) {
+    stopWatering();
   }
 }
 
@@ -99,6 +202,8 @@ void handleStatus() {
   body += String(millis() / 1000UL);
   body += ",\"pumpCount\":";
   body += String(PUMP_COUNT);
+  body += ",\"watering\":";
+  body += wateringToJson();
   body += ",\"lastWatered\":";
   body += lastWateredToJson();
   body += ",\"pumps\":";
@@ -218,6 +323,8 @@ void handleConfig() {
 
   String resp = "{\"ok\":true,\"message\":\"Saved (RAM)\",\"lastWatered\":";
   resp += lastWateredToJson();
+  resp += ",\"watering\":";
+  resp += wateringToJson();
   resp += ",\"pumps\":";
   resp += pumpsToJson();
   resp += '}';
@@ -248,18 +355,31 @@ void handleWater() {
     return;
   }
 
-  lastWateredIndex = (int8_t)pump;
-  lastWateredAtMs = millis();
+  if (isWateringActive()) {
+    String resp = "{\"ok\":false,\"message\":\"busy\",\"watering\":";
+    resp += wateringToJson();
+    resp += ",\"lastWatered\":";
+    resp += lastWateredToJson();
+    resp += '}';
+    server.send(409, "application/json; charset=utf-8", resp);
+    return;
+  }
 
-  Serial.print("[water] stub pump=");
-  Serial.print(pump);
-  Serial.print(" sec=");
-  Serial.println(pumps[pump].durationSec);
+  if (!startWater((uint8_t)pump)) {
+    server.send(500, "application/json; charset=utf-8",
+                "{\"ok\":false,\"message\":\"Failed to start watering\"}");
+    return;
+  }
 
-  String resp = "{\"ok\":true,\"message\":\"Water request for pump ";
+  String resp = "{\"ok\":true,\"message\":\"Watering pump ";
   resp += String(pump + 1);
-  resp += " (stub)\",\"pump\":";
+  resp += "\",\"pump\":";
   resp += String(pump);
+  resp += ",\"durationSec\":";
+  resp += String(pumps[pump].durationSec);
+  resp += ",\"active\":true";
+  resp += ",\"watering\":";
+  resp += wateringToJson();
   resp += ",\"lastWatered\":";
   resp += lastWateredToJson();
   resp += '}';
@@ -287,6 +407,8 @@ void printBanner(bool apOk) {
   Serial.println(WiFi.softAPIP());
   Serial.print(" Pumps: ");
   Serial.println(PUMP_COUNT);
+  Serial.print(" Relay: ");
+  Serial.println(RELAY_ACTIVE_LOW ? "Active LOW" : "Active HIGH");
   Serial.println(" Open in browser:");
   Serial.println("   http://192.168.4.1");
   Serial.println(" (use http, not https)");
@@ -307,6 +429,7 @@ void setup() {
   Serial.println(SERIAL_BAUD);
 
   initPumps();
+  initRelays();
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
@@ -336,4 +459,5 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
+  updateWatering();
 }
