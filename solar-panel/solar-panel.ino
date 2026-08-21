@@ -94,23 +94,22 @@ void ServoAction(){
   int D = analogRead(d_state);
   /**********************system adjusting left and right序**********************/
   //  abs() is the absolute value function
-  if (abs(L - R) > error && L > R) { //Determine whether the error is within the acceptable range, otherwise adjust the steering gear
-    lr_angle -= resolution;//reduce the angle
-    //    lr_servo.attach(lr_servopin);  // connect servo
-    if (lr_angle < 0) { //limit the rotation angle of the servo
-      lr_angle = 0;
+  // Направление инвертировано: нижний серво стоит «наоборот»
+  if (abs(L - R) > error && L > R) {
+    lr_angle += resolution;
+    if (lr_angle > 180) {
+      lr_angle = 180;
     }
-    lr_servo.write(lr_angle);  //output the angle of the servooutput the angle of servo
+    lr_servo.write(lr_angle);
     delay(m_speed);
 
   }
-  else if (abs(L - R) > error && L < R) { //Determine whether the error is within the acceptable range, otherwise adjust the steering gear
-    lr_angle += resolution;//increase the angle
-    //    lr_servo.attach(lr_servopin);    // connect servo
-    if (lr_angle > 180) { //limit the rotation angle of servo
-      lr_angle = 180;
+  else if (abs(L - R) > error && L < R) {
+    lr_angle -= resolution;
+    if (lr_angle < 0) {
+      lr_angle = 0;
     }
-    lr_servo.write(lr_angle);  //output the angle of servo
+    lr_servo.write(lr_angle);
     delay(m_speed);
 
   }
