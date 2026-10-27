@@ -20,13 +20,31 @@ static const uint32_t STORE_MAGIC = 0x47445231UL;  // "GDR1"
 static const uint16_t STORE_VERSION = 1;
 static const uint32_t NVS_AUTOSAVE_SEC = 300;  // snapshot countdowns every 5 min
 
-// Active LOW: LOW = relay ON, HIGH = relay OFF (typical modules).
+// Typical 16-ch 5V opto relay boards: LOW = ON, HIGH = OFF.
+// Pumps are switched by relay contacts (separate 5V pump supply on COM/NO).
 static const bool RELAY_ACTIVE_LOW = true;
 
-// Module 1: IN1..IN8, Module 2: IN1..IN8
+// 16-channel relay module, IN1..IN16 wired as listed below.
+// IMPORTANT: GPIO4 and GPIO5 are ESP32 boot-strapping pins. Their state
+// during reset is not controlled by this sketch. Test without pumps first.
+// ESP32 GPIO are 3.3V outputs; check that relay inputs recognize HIGH as OFF.
 static const uint8_t RELAY_PINS[PUMP_COUNT] = {
-  13, 12, 14, 27, 26, 25, 33, 32,
-  4, 16, 17, 5, 18, 19, 21, 22
+  26, // IN1  -> GPIO26
+  23, // IN2  -> GPIO23
+  27, // IN3  -> GPIO27
+  22, // IN4  -> GPIO22
+  32, // IN5  -> GPIO32
+  21, // IN6  -> GPIO21
+  33, // IN7  -> GPIO33
+  19, // IN8  -> GPIO19
+  14, // IN9  -> GPIO14
+  18, // IN10 -> GPIO18
+  13, // IN11 -> GPIO13
+  17, // IN12 -> GPIO17
+   4, // IN13 -> GPIO4  (boot-strapping pin)
+  16, // IN14 -> GPIO16
+   5, // IN15 -> GPIO5  (boot-strapping pin)
+  25  // IN16 -> GPIO25
 };
 
 WebServer server(80);
@@ -176,11 +194,19 @@ void allRelaysOff() {
   }
 }
 
+uint8_t relayOffLevel() {
+  return RELAY_ACTIVE_LOW ? HIGH : LOW;
+}
+
 void initRelays() {
+  // Set OFF level before switching to OUTPUT — Active LOW boards turn ON at LOW,
+  // and pinMode(OUTPUT) alone often starts as LOW (all pumps would pulse on boot).
+  const uint8_t off = relayOffLevel();
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    digitalWrite(RELAY_PINS[i], off);
     pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], off);
   }
-  allRelaysOff();
   activePump = -1;
   waterUntilMs = 0;
 }
@@ -602,8 +628,16 @@ void printBanner(bool apOk) {
   Serial.println(WiFi.softAPIP());
   Serial.print(" Pumps: ");
   Serial.println(PUMP_COUNT);
-  Serial.print(" Relay: ");
+  Serial.print(" Relay: 16-ch, ");
   Serial.println(RELAY_ACTIVE_LOW ? "Active LOW" : "Active HIGH");
+  Serial.println(" Pins IN1..IN16:");
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    Serial.print("  IN");
+    Serial.print(i + 1);
+    Serial.print("=GPIO");
+    Serial.print(RELAY_PINS[i]);
+    Serial.print((i % 4 == 3) ? "\n" : " ");
+  }
   Serial.println(" Schedule: auto by dueInSec + NVS");
   Serial.println(" Open in browser:");
   Serial.println("   http://192.168.4.1");
@@ -613,6 +647,9 @@ void printBanner(bool apOk) {
 }
 
 void setup() {
+  // Set relay outputs OFF as early as application code permits.
+  // This does not prevent transient states during ESP32 reset/boot.
+  initRelays();
   Serial.begin(SERIAL_BAUD);
   delay(500);
   while (Serial.available()) {
@@ -627,7 +664,6 @@ void setup() {
   initPumpsDefaults();
   prefs.begin("garden", false);
   loadStateFromNvs();
-  initRelays();
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
