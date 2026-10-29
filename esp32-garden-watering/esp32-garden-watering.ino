@@ -1,699 +1,744 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <string.h>
+#include <ArduinoJson.h>
+#include <esp_timer.h>
+
 #include "web_ui.h"
 
-static const char* AP_SSID = "esp32-garden-1";
-static const char* AP_PASS = "begemotic1";
+// -------------------- Wi-Fi --------------------
 
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_GW(192, 168, 4, 1);
-static const IPAddress AP_MASK(255, 255, 255, 0);
+const char* AP_SSID = "esp32-garden-1";
+const char* AP_PASS = "begemotic1";
 
-static const uint32_t SERIAL_BAUD = 115200;
-static const uint8_t PUMP_COUNT = 16;
-static const uint8_t PUMP_NAME_MAX = 24;
-
-static const uint32_t STORE_MAGIC = 0x47445231UL;  // "GDR1"
-static const uint16_t STORE_VERSION = 1;
-static const uint32_t NVS_AUTOSAVE_SEC = 300;  // snapshot countdowns every 5 min
-
-// Typical 16-ch 5V opto relay boards: LOW = ON, HIGH = OFF.
-// Pumps are switched by relay contacts (separate 5V pump supply on COM/NO).
-static const bool RELAY_ACTIVE_LOW = true;
-
-// 16-channel relay module, IN1..IN16 wired as listed below.
-// IMPORTANT: GPIO4 and GPIO5 are ESP32 boot-strapping pins. Their state
-// during reset is not controlled by this sketch. Test without pumps first.
-// ESP32 GPIO are 3.3V outputs; check that relay inputs recognize HIGH as OFF.
-static const uint8_t RELAY_PINS[PUMP_COUNT] = {
-  26, // IN1  -> GPIO26
-  23, // IN2  -> GPIO23
-  27, // IN3  -> GPIO27
-  22, // IN4  -> GPIO22
-  32, // IN5  -> GPIO32
-  21, // IN6  -> GPIO21
-  33, // IN7  -> GPIO33
-  19, // IN8  -> GPIO19
-  14, // IN9  -> GPIO14
-  18, // IN10 -> GPIO18
-  13, // IN11 -> GPIO13
-  17, // IN12 -> GPIO17
-   4, // IN13 -> GPIO4  (boot-strapping pin)
-  16, // IN14 -> GPIO16
-   5, // IN15 -> GPIO5  (boot-strapping pin)
-  25  // IN16 -> GPIO25
-};
+IPAddress AP_IP(192, 168, 4, 1);
+IPAddress AP_MASK(255, 255, 255, 0);
 
 WebServer server(80);
 DNSServer dnsServer;
-Preferences prefs;
+Preferences preferences;
 
-struct PumpConfig {
-  char name[PUMP_NAME_MAX];
-  bool enabled;
-  uint16_t durationSec;
-  uint16_t intervalHours;   // typical: 48 = every 2 days
-  uint32_t dueInSec;        // countdown to next auto water (frozen when disabled)
-  uint32_t wateredAgoSec;   // seconds since last water (UINT32_MAX = never)
+// -------------------- Реле --------------------
+
+constexpr uint8_t PUMP_COUNT = 16;
+
+// Порядок: IN1, IN2, ... IN16
+const uint8_t RELAY_PINS[PUMP_COUNT] = {
+  26, 23, 27, 22,
+  32, 21, 33, 19,
+  14, 18, 13, 17,
+   4, 16,  5, 25
 };
 
-struct PersistedState {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t pumpCount;
-  PumpConfig pumps[PUMP_COUNT];
-  int8_t lastWateredIndex;
-  uint8_t reserved[3];
+// Проверенная логика Active LOW
+constexpr uint8_t RELAY_ON  = LOW;
+constexpr uint8_t RELAY_OFF = HIGH;
+
+// -------------------- Настройки --------------------
+
+struct PumpConfig {
+  String name;
+  bool enabled = false;
+  uint16_t durationSec = 30;
+  uint16_t intervalHours = 48;
+
+  // Время следующего автополива
+  uint64_t nextDueSec = 0;
 };
 
 PumpConfig pumps[PUMP_COUNT];
-int8_t lastWateredIndex = -1;
 
-int8_t activePump = -1;
-uint32_t waterUntilMs = 0;
+// Номер работающего насоса.
+// -1 означает, что ничего не работает.
+int activePump = -1;
 
-bool configDirty = false;
-uint32_t lastTickMs = 0;
-uint32_t secSinceNvsSave = 0;
+uint32_t wateringStartedMs = 0;
+uint32_t wateringDurationMs = 0;
 
-uint32_t intervalToSec(uint16_t intervalHours) {
-  return (uint32_t)intervalHours * 3600UL;
+int lastWateredIndex = -1;
+uint64_t lastWateredAtSec = 0;
+
+// -------------------- Время --------------------
+
+// Монотонное время работы ESP32.
+// Не зависит от переполнения millis().
+uint64_t uptimeSec() {
+  return (uint64_t)(esp_timer_get_time() / 1000000ULL);
 }
 
-void markDirty() {
-  configDirty = true;
+uint64_t intervalSec(uint8_t index) {
+  return (uint64_t)pumps[index].intervalHours * 3600ULL;
 }
 
-void initPumpsDefaults() {
-  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    snprintf(pumps[i].name, PUMP_NAME_MAX, "Насос %u", i + 1);
-    pumps[i].enabled = false;
-    pumps[i].durationSec = 30;
-    pumps[i].intervalHours = 48;
-    pumps[i].dueInSec = intervalToSec(pumps[i].intervalHours);
-    pumps[i].wateredAgoSec = UINT32_MAX;
-  }
-  lastWateredIndex = -1;
+void scheduleNext(uint8_t index) {
+  pumps[index].nextDueSec =
+      uptimeSec() + intervalSec(index);
 }
 
-bool saveStateToNvs() {
-  PersistedState st;
-  memset(&st, 0, sizeof(st));
-  st.magic = STORE_MAGIC;
-  st.version = STORE_VERSION;
-  st.pumpCount = PUMP_COUNT;
-  memcpy(st.pumps, pumps, sizeof(pumps));
-  st.lastWateredIndex = lastWateredIndex;
+// -------------------- Управление реле --------------------
 
-  bool ok = prefs.putBytes("state", &st, sizeof(st)) == sizeof(st);
-  if (ok) {
-    configDirty = false;
-    secSinceNvsSave = 0;
-    Serial.println("[nvs] state saved");
-  } else {
-    Serial.println("[nvs] save FAILED");
-  }
-  return ok;
-}
-
-bool loadStateFromNvs() {
-  size_t len = prefs.getBytesLength("state");
-  if (len != sizeof(PersistedState)) {
-    Serial.print("[nvs] no valid state (len=");
-    Serial.print(len);
-    Serial.println("), using defaults");
-    return false;
-  }
-
-  PersistedState st;
-  if (prefs.getBytes("state", &st, sizeof(st)) != sizeof(st)) {
-    Serial.println("[nvs] read failed");
-    return false;
-  }
-  if (st.magic != STORE_MAGIC || st.version != STORE_VERSION || st.pumpCount != PUMP_COUNT) {
-    Serial.println("[nvs] magic/version mismatch, using defaults");
-    return false;
-  }
-
-  memcpy(pumps, st.pumps, sizeof(pumps));
-  lastWateredIndex = st.lastWateredIndex;
-  if (lastWateredIndex < -1 || lastWateredIndex >= (int8_t)PUMP_COUNT) {
-    lastWateredIndex = -1;
-  }
-
-  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    pumps[i].name[PUMP_NAME_MAX - 1] = '\0';
-    if (pumps[i].durationSec < 1) pumps[i].durationSec = 1;
-    if (pumps[i].durationSec > 3600) pumps[i].durationSec = 3600;
-    if (pumps[i].intervalHours < 1) pumps[i].intervalHours = 1;
-    if (pumps[i].intervalHours > 8760) pumps[i].intervalHours = 8760;
-    uint32_t maxDue = intervalToSec(pumps[i].intervalHours);
-    if (pumps[i].dueInSec > maxDue) pumps[i].dueInSec = maxDue;
-  }
-
-  Serial.println("[nvs] state loaded");
-  return true;
-}
-
-void saveStateIfNeeded(bool force) {
-  if (force) {
-    saveStateToNvs();
-    return;
-  }
-  // Periodic snapshot so dueInSec / wateredAgo survive reboot (without wearing NVS every second).
-  if (secSinceNvsSave >= NVS_AUTOSAVE_SEC) {
-    saveStateToNvs();
-  }
-}
-
-void resetPumpSchedule(uint8_t index) {
+void relayOff(uint8_t index) {
   if (index >= PUMP_COUNT) return;
-  pumps[index].dueInSec = intervalToSec(pumps[index].intervalHours);
-  pumps[index].wateredAgoSec = 0;
-  lastWateredIndex = (int8_t)index;
-  markDirty();
+
+  digitalWrite(RELAY_PINS[index], RELAY_OFF);
 }
 
-void relayWrite(uint8_t index, bool on) {
+void relayOn(uint8_t index) {
   if (index >= PUMP_COUNT) return;
-  uint8_t level;
-  if (RELAY_ACTIVE_LOW) {
-    level = on ? LOW : HIGH;
-  } else {
-    level = on ? HIGH : LOW;
-  }
-  digitalWrite(RELAY_PINS[index], level);
+
+  digitalWrite(RELAY_PINS[index], RELAY_ON);
 }
 
 void allRelaysOff() {
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    relayWrite(i, false);
+    relayOff(i);
   }
 }
 
-uint8_t relayOffLevel() {
-  return RELAY_ACTIVE_LOW ? HIGH : LOW;
-}
-
+// Вызываем в самом начале setup()
 void initRelays() {
-  // Set OFF level before switching to OUTPUT — Active LOW boards turn ON at LOW,
-  // and pinMode(OUTPUT) alone often starts as LOW (all pumps would pulse on boot).
-  const uint8_t off = relayOffLevel();
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    digitalWrite(RELAY_PINS[i], off);
+    // Сначала задаём HIGH, потом OUTPUT.
+    // Точно как в нашем работающем тесте.
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
     pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], off);
   }
+
+  allRelaysOff();
   activePump = -1;
-  waterUntilMs = 0;
 }
 
-bool isWateringActive() {
-  return activePump >= 0 && activePump < PUMP_COUNT;
-}
+// -------------------- Конфигурация --------------------
 
-uint32_t wateringRemainSec() {
-  if (!isWateringActive()) return 0;
-  uint32_t now = millis();
-  if ((int32_t)(waterUntilMs - now) <= 0) return 0;
-  return (waterUntilMs - now + 999UL) / 1000UL;
-}
-
-String wateringToJson() {
-  String json = "{";
-  json += "\"active\":";
-  json += isWateringActive() ? "true" : "false";
-  json += ",\"pump\":";
-  if (isWateringActive()) {
-    json += String(activePump);
-  } else {
-    json += "null";
+void defaultConfig() {
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    pumps[i].name = "Насос " + String(i + 1);
+    pumps[i].enabled = false;
+    pumps[i].durationSec = 30;
+    pumps[i].intervalHours = 48;
+    scheduleNext(i);
   }
-  json += ",\"remainSec\":";
-  json += String(wateringRemainSec());
-  json += '}';
-  return json;
+}
+
+void saveConfig() {
+  JsonDocument doc;
+  JsonArray arr = doc["pumps"].to<JsonArray>();
+
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    JsonObject p = arr.add<JsonObject>();
+
+    p["name"] = pumps[i].name;
+    p["enabled"] = pumps[i].enabled;
+    p["durationSec"] = pumps[i].durationSec;
+    p["intervalHours"] = pumps[i].intervalHours;
+  }
+
+  String json;
+  serializeJson(doc, json);
+
+  preferences.putString("config", json);
+}
+
+void loadConfig() {
+  defaultConfig();
+
+  String json = preferences.getString("config", "");
+
+  if (json.isEmpty()) {
+    Serial.println("[config] Default configuration");
+    return;
+  }
+
+  JsonDocument doc;
+
+  if (deserializeJson(doc, json)) {
+    Serial.println("[config] Invalid saved JSON");
+    return;
+  }
+
+  JsonArrayConst arr =
+      doc["pumps"].as<JsonArrayConst>();
+
+  if (arr.size() != PUMP_COUNT) {
+    Serial.println("[config] Unexpected pump count");
+    return;
+  }
+
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    JsonObjectConst p = arr[i];
+
+    String name = p["name"] | "";
+
+    name.trim();
+    if (!name.isEmpty()) {
+      pumps[i].name = name.substring(0, 48);
+    }
+
+    pumps[i].enabled = p["enabled"] | false;
+
+    int duration = p["durationSec"] | 30;
+    int interval = p["intervalHours"] | 48;
+
+    pumps[i].durationSec =
+        constrain(duration, 1, 3600);
+
+    pumps[i].intervalHours =
+        constrain(interval, 1, 8760);
+
+    // После перезагрузки расписание начинается
+    // заново: часов реального времени у нас нет.
+    scheduleNext(i);
+  }
+
+  Serial.println("[config] Loaded from flash");
+}
+
+// -------------------- Запуск и остановка --------------------
+
+bool startWatering(uint8_t index) {
+  if (index >= PUMP_COUNT) return false;
+  if (activePump >= 0) return false;
+
+  // Гарантированно выключаем остальные
+  allRelaysOff();
+
+  activePump = index;
+  wateringStartedMs = millis();
+
+  wateringDurationMs =
+      (uint32_t)pumps[index].durationSec * 1000UL;
+
+  lastWateredIndex = index;
+  lastWateredAtSec = uptimeSec();
+
+  // Отсчёт следующего цикла от этого запуска
+  scheduleNext(index);
+
+  relayOn(index);
+
+  Serial.printf(
+    "[water] ON pump %u, duration %u sec\n",
+    index + 1,
+    pumps[index].durationSec
+  );
+
+  return true;
 }
 
 void stopWatering() {
-  if (isWateringActive()) {
-    Serial.print("[water] stop pump=");
-    Serial.println(activePump);
-    relayWrite((uint8_t)activePump, false);
+  if (activePump < 0) {
+    allRelaysOff();
+    return;
   }
+
+  int finishedPump = activePump;
+
+  // Сначала отключаем физическое реле
+  relayOff((uint8_t)finishedPump);
+  allRelaysOff();
+
   activePump = -1;
-  waterUntilMs = 0;
+  wateringDurationMs = 0;
+
+  Serial.printf(
+    "[water] OFF pump %d\n",
+    finishedPump + 1
+  );
 }
 
-bool startWater(uint8_t pump) {
-  if (pump >= PUMP_COUNT) return false;
-  if (isWateringActive()) return false;
+uint32_t remainingSec() {
+  if (activePump < 0) return 0;
 
-  allRelaysOff();
-  relayWrite(pump, true);
+  uint32_t elapsed = millis() - wateringStartedMs;
 
-  activePump = (int8_t)pump;
-  waterUntilMs = millis() + (uint32_t)pumps[pump].durationSec * 1000UL;
-  resetPumpSchedule(pump);
+  if (elapsed >= wateringDurationMs) return 0;
 
-  Serial.print("[water] start pump=");
-  Serial.print(pump);
-  Serial.print(" pin=");
-  Serial.print(RELAY_PINS[pump]);
-  Serial.print(" sec=");
-  Serial.println(pumps[pump].durationSec);
-  return true;
+  return (wateringDurationMs - elapsed + 999UL)
+      / 1000UL;
 }
 
 void updateWatering() {
-  if (!isWateringActive()) return;
-  if ((int32_t)(millis() - waterUntilMs) >= 0) {
-    stopWatering();
-  }
-}
-
-// Tick once per second: countdowns, auto schedule, NVS autosave.
-void updateScheduleTick() {
-  uint32_t now = millis();
-  if (lastTickMs == 0) {
-    lastTickMs = now;
-    return;
-  }
-  while ((int32_t)(now - lastTickMs) >= 1000) {
-    lastTickMs += 1000;
-    secSinceNvsSave++;
-
-    for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-      if (pumps[i].wateredAgoSec != UINT32_MAX && pumps[i].wateredAgoSec < UINT32_MAX - 1) {
-        pumps[i].wateredAgoSec++;
-      }
-      if (!pumps[i].enabled) continue;
-      if (pumps[i].dueInSec > 0) {
-        pumps[i].dueInSec--;
-      }
-    }
-
-    // Start the most overdue enabled pump when idle.
-    if (!isWateringActive()) {
-      int8_t best = -1;
-      uint32_t bestOverdue = 0;
-      for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-        if (!pumps[i].enabled) continue;
-        if (pumps[i].dueInSec > 0) continue;
-        // Overdue score: prefer longest-waiting (highest wateredAgo, or never).
-        uint32_t overdue = (pumps[i].wateredAgoSec == UINT32_MAX)
-                               ? UINT32_MAX
-                               : pumps[i].wateredAgoSec;
-        if (best < 0 || overdue >= bestOverdue) {
-          best = (int8_t)i;
-          bestOverdue = overdue;
-        }
-      }
-      if (best >= 0) {
-        Serial.print("[schedule] auto water pump=");
-        Serial.println(best);
-        if (startWater((uint8_t)best)) {
-          saveStateToNvs();
-        }
-      }
-    }
-
-    saveStateIfNeeded(false);
-  }
-}
-
-String jsonEscape(const String& s) {
-  String out;
-  out.reserve(s.length() + 4);
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out += c;
+  // Выключение по таймеру
+  if (activePump >= 0) {
+    if ((uint32_t)(millis() - wateringStartedMs)
+        >= wateringDurationMs) {
+      stopWatering();
     }
   }
-  return out;
-}
 
-String pumpsToJson() {
-  String json = "[";
+  // Пока один насос работает,
+  // второй не запускаем.
+  if (activePump >= 0) return;
+
+  uint64_t now = uptimeSec();
+
+  // Проверяем ожидающие автополивы.
+  // Если несколько готовы, запускаем
+  // только первый по номеру.
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    if (i) json += ',';
-    json += '{';
-    json += "\"name\":\"" + jsonEscape(String(pumps[i].name)) + "\",";
-    json += "\"enabled\":";
-    json += pumps[i].enabled ? "true" : "false";
-    json += ",\"durationSec\":";
-    json += String(pumps[i].durationSec);
-    json += ",\"intervalHours\":";
-    json += String(pumps[i].intervalHours);
-    json += ",\"dueInSec\":";
-    json += String(pumps[i].dueInSec);
-    json += ",\"wateredAgoSec\":";
-    if (pumps[i].wateredAgoSec == UINT32_MAX) {
-      json += "null";
-    } else {
-      json += String(pumps[i].wateredAgoSec);
+    if (!pumps[i].enabled) continue;
+
+    if (now >= pumps[i].nextDueSec) {
+      startWatering(i);
+      break;
     }
-    json += '}';
   }
-  json += ']';
-  return json;
 }
 
-String lastWateredToJson() {
-  if (lastWateredIndex < 0 || lastWateredIndex >= PUMP_COUNT) {
-    return "null";
+// -------------------- Формирование JSON --------------------
+
+void appendStatus(JsonDocument& doc) {
+  doc["apSsid"] = AP_SSID;
+  doc["ip"] = WiFi.softAPIP().toString();
+  doc["uptimeSec"] = uptimeSec();
+  doc["pumpCount"] = PUMP_COUNT;
+
+  JsonObject watering =
+      doc["watering"].to<JsonObject>();
+
+  watering["active"] = activePump >= 0;
+
+  if (activePump >= 0) {
+    watering["pump"] = activePump;
+    watering["remainSec"] = remainingSec();
+  } else {
+    watering["pump"] = nullptr;
+    watering["remainSec"] = 0;
   }
-  uint8_t i = (uint8_t)lastWateredIndex;
-  if (pumps[i].wateredAgoSec == UINT32_MAX) {
-    return "null";
+
+  if (lastWateredIndex >= 0) {
+    JsonObject last =
+        doc["lastWatered"].to<JsonObject>();
+
+    last["index"] = lastWateredIndex;
+    last["name"] = pumps[lastWateredIndex].name;
+    last["agoSec"] =
+        uptimeSec() - lastWateredAtSec;
+  } else {
+    doc["lastWatered"] = nullptr;
   }
-  String json = "{";
-  json += "\"index\":";
-  json += String(lastWateredIndex);
-  json += ",\"name\":\"" + jsonEscape(String(pumps[i].name)) + "\",";
-  json += "\"agoSec\":";
-  json += String(pumps[i].wateredAgoSec);
-  json += '}';
-  return json;
+
+  JsonArray arr = doc["pumps"].to<JsonArray>();
+  uint64_t now = uptimeSec();
+
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    JsonObject p = arr.add<JsonObject>();
+
+    p["name"] = pumps[i].name;
+    p["enabled"] = pumps[i].enabled;
+    p["durationSec"] = pumps[i].durationSec;
+    p["intervalHours"] = pumps[i].intervalHours;
+
+    uint32_t due = 0;
+
+    if (pumps[i].nextDueSec > now) {
+      due = (uint32_t)(pumps[i].nextDueSec - now);
+    }
+
+    p["dueInSec"] = due;
+  }
 }
+
+void sendJson(int statusCode, JsonDocument& doc) {
+  String json;
+  serializeJson(doc, json);
+
+  server.send(
+    statusCode,
+    "application/json; charset=utf-8",
+    json
+  );
+}
+
+void sendError(int statusCode, const char* message) {
+  JsonDocument doc;
+  doc["ok"] = false;
+  doc["message"] = message;
+
+  sendJson(statusCode, doc);
+}
+
+// -------------------- HTTP API --------------------
 
 void handleRoot() {
-  server.send_P(200, "text/html; charset=utf-8", WEB_UI_HTML);
+  server.send_P(
+    200,
+    "text/html; charset=utf-8",
+    WEB_UI_HTML
+  );
+}
+
+
+void handleCaptivePortal() {
+  // Отправляем телефон на главную страницу GardenESP
+  server.sendHeader(
+    "Location",
+    "http://192.168.4.1/",
+    true
+  );
+
+  server.send(
+    302,
+    "text/plain",
+    "Redirecting to GardenESP"
+  );
 }
 
 void handleStatus() {
-  String body = "{";
-  body += "\"apSsid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
-  body += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
-  body += "\"uptimeSec\":";
-  body += String(millis() / 1000UL);
-  body += ",\"pumpCount\":";
-  body += String(PUMP_COUNT);
-  body += ",\"watering\":";
-  body += wateringToJson();
-  body += ",\"lastWatered\":";
-  body += lastWateredToJson();
-  body += ",\"pumps\":";
-  body += pumpsToJson();
-  body += '}';
-  server.send(200, "application/json; charset=utf-8", body);
-}
+  JsonDocument doc;
+  appendStatus(doc);
 
-bool extractBool(const String& body, const String& key, bool fallback) {
-  String needle = "\"" + key + "\"";
-  int keyPos = body.indexOf(needle);
-  if (keyPos < 0) return fallback;
-  int colon = body.indexOf(':', keyPos + needle.length());
-  if (colon < 0) return fallback;
-  int i = colon + 1;
-  while (i < (int)body.length() && isspace((unsigned char)body[i])) i++;
-  if (body.substring(i, i + 4) == "true") return true;
-  if (body.substring(i, i + 5) == "false") return false;
-  return fallback;
-}
-
-long extractNumberAfter(const String& body, int from, const String& key, long fallback) {
-  String needle = "\"" + key + "\"";
-  int keyPos = body.indexOf(needle, from);
-  if (keyPos < 0) return fallback;
-  int colon = body.indexOf(':', keyPos + needle.length());
-  if (colon < 0) return fallback;
-  int i = colon + 1;
-  while (i < (int)body.length() && isspace((unsigned char)body[i])) i++;
-  return body.substring(i).toInt();
-}
-
-bool extractQuotedString(const String& obj, const char* key, char* dest, size_t destSize) {
-  String needle = String("\"") + key + "\"";
-  int keyPos = obj.indexOf(needle);
-  if (keyPos < 0) return false;
-  int colon = obj.indexOf(':', keyPos + needle.length());
-  if (colon < 0) return false;
-  int q1 = obj.indexOf('"', colon + 1);
-  if (q1 < 0) return false;
-
-  String out;
-  out.reserve(PUMP_NAME_MAX);
-  for (int i = q1 + 1; i < (int)obj.length(); i++) {
-    char c = obj[i];
-    if (c == '\\' && i + 1 < (int)obj.length()) {
-      out += obj[i + 1];
-      i++;
-      continue;
-    }
-    if (c == '"') break;
-    out += c;
-  }
-
-  out.trim();
-  if (out.length() == 0) return false;
-  out.toCharArray(dest, destSize);
-  return true;
+  sendJson(200, doc);
 }
 
 void handleConfig() {
-  if (server.method() != HTTP_POST) {
-    server.send(405, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"Method not allowed\"}");
+  JsonDocument request;
+
+  if (deserializeJson(request, server.arg("plain"))) {
+    sendError(400, "Invalid JSON");
     return;
   }
 
-  String body = server.arg("plain");
-  if (body.length() == 0) {
-    server.send(400, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"Empty body\"}");
+  JsonArrayConst arr =
+      request["pumps"].as<JsonArrayConst>();
+
+  if (arr.size() != PUMP_COUNT) {
+    sendError(400, "Expected exactly 16 pumps");
     return;
   }
 
-  int searchFrom = body.indexOf('[');
-  if (searchFrom < 0) {
-    server.send(400, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"pumps array missing\"}");
-    return;
-  }
-
+  // Проверяем данные до изменения конфигурации
   for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    int objStart = body.indexOf('{', searchFrom);
-    if (objStart < 0) break;
-    int objEnd = body.indexOf('}', objStart);
-    if (objEnd < 0) break;
-    String obj = body.substring(objStart, objEnd + 1);
+    JsonObjectConst p = arr[i];
 
-    bool wasEnabled = pumps[i].enabled;
-    uint16_t oldInterval = pumps[i].intervalHours;
-
-    char newName[PUMP_NAME_MAX];
-    if (extractQuotedString(obj, "name", newName, PUMP_NAME_MAX)) {
-      strncpy(pumps[i].name, newName, PUMP_NAME_MAX - 1);
-      pumps[i].name[PUMP_NAME_MAX - 1] = '\0';
+    if (!p["name"].is<const char*>() ||
+        !p["enabled"].is<bool>() ||
+        !p["durationSec"].is<int>() ||
+        !p["intervalHours"].is<int>()) {
+      sendError(400, "Invalid pump settings");
+      return;
     }
 
-    pumps[i].enabled = extractBool(obj, "enabled", pumps[i].enabled);
+    int duration = p["durationSec"].as<int>();
+    int interval = p["intervalHours"].as<int>();
 
-    long duration = extractNumberAfter(obj, 0, "durationSec", pumps[i].durationSec);
-    long interval = extractNumberAfter(obj, 0, "intervalHours", pumps[i].intervalHours);
-    if (duration < 1) duration = 1;
-    if (duration > 3600) duration = 3600;
-    if (interval < 1) interval = 1;
-    if (interval > 8760) interval = 8760;
-    pumps[i].durationSec = (uint16_t)duration;
-    pumps[i].intervalHours = (uint16_t)interval;
-
-    uint32_t newIntervalSec = intervalToSec(pumps[i].intervalHours);
-
-    // Newly enabled: wait a full interval before first auto water.
-    if (!wasEnabled && pumps[i].enabled) {
-      pumps[i].dueInSec = newIntervalSec;
-    } else if (pumps[i].intervalHours != oldInterval) {
-      if (pumps[i].dueInSec > newIntervalSec) {
-        pumps[i].dueInSec = newIntervalSec;
-      }
+    if (duration < 1 || duration > 3600 ||
+        interval < 1 || interval > 8760) {
+      sendError(400, "Value out of range");
+      return;
     }
-
-    Serial.print("[config] pump ");
-    Serial.print(i);
-    Serial.print(" enabled=");
-    Serial.print(pumps[i].enabled);
-    Serial.print(" duration=");
-    Serial.print(pumps[i].durationSec);
-    Serial.print(" intervalH=");
-    Serial.print(pumps[i].intervalHours);
-    Serial.print(" dueInSec=");
-    Serial.println(pumps[i].dueInSec);
-
-    searchFrom = objEnd + 1;
   }
 
-  markDirty();
-  bool saved = saveStateToNvs();
+  // Применяем настройки
+  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
+    JsonObjectConst p = arr[i];
 
-  String resp = "{\"ok\":true,\"message\":\"";
-  resp += saved ? "Сохранено" : "Сохранено (NVS ошибка)";
-  resp += "\",\"lastWatered\":";
-  resp += lastWateredToJson();
-  resp += ",\"watering\":";
-  resp += wateringToJson();
-  resp += ",\"pumps\":";
-  resp += pumpsToJson();
-  resp += '}';
-  server.send(200, "application/json; charset=utf-8", resp);
+    String name = p["name"].as<String>();
+    name.trim();
+
+    pumps[i].name = name.isEmpty()
+        ? "Насос " + String(i + 1)
+        : name.substring(0, 48);
+
+    pumps[i].enabled = p["enabled"].as<bool>();
+    pumps[i].durationSec =
+        p["durationSec"].as<uint16_t>();
+    pumps[i].intervalHours =
+        p["intervalHours"].as<uint16_t>();
+
+    scheduleNext(i);
+  }
+
+  saveConfig();
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["message"] = "Настройки сохранены";
+  appendStatus(response);
+
+  sendJson(200, response);
+
+  Serial.println("[config] Saved");
 }
 
 void handleWater() {
-  if (server.method() != HTTP_POST) {
-    server.send(405, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"Method not allowed\"}");
+  if (!server.hasArg("pump")) {
+    sendError(400, "Missing pump");
     return;
   }
 
-  int pump = -1;
-  if (server.hasArg("pump")) {
-    pump = server.arg("pump").toInt();
-  } else if (server.hasArg("zone")) {
-    pump = server.arg("zone").toInt();
-  } else {
-    String body = server.arg("plain");
-    pump = (int)extractNumberAfter(body, 0, "pump", -1);
-    if (pump < 0) pump = (int)extractNumberAfter(body, 0, "zone", -1);
+  String value = server.arg("pump");
+  value.trim();
+
+  for (size_t i = 0; i < value.length(); i++) {
+    if (!isDigit(value[i])) {
+      sendError(400, "Invalid pump");
+      return;
+    }
   }
 
-  if (pump < 0 || pump >= PUMP_COUNT) {
-    server.send(400, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"Bad pump\"}");
+  if (value.isEmpty()) {
+    sendError(400, "Invalid pump");
     return;
   }
 
-  if (isWateringActive()) {
-    String resp = "{\"ok\":false,\"message\":\"busy\",\"watering\":";
-    resp += wateringToJson();
-    resp += ",\"lastWatered\":";
-    resp += lastWateredToJson();
-    resp += '}';
-    server.send(409, "application/json; charset=utf-8", resp);
+  int index = value.toInt();
+
+  if (index < 0 || index >= PUMP_COUNT) {
+    sendError(400, "Invalid pump");
     return;
   }
 
-  if (!startWater((uint8_t)pump)) {
-    server.send(500, "application/json; charset=utf-8",
-                "{\"ok\":false,\"message\":\"Failed to start watering\"}");
+  if (activePump >= 0) {
+    JsonDocument response;
+    response["ok"] = false;
+    response["message"] = "busy";
+    appendStatus(response);
+
+    sendJson(409, response);
     return;
   }
 
-  saveStateToNvs();
+  if (!startWatering((uint8_t)index)) {
+    sendError(409, "Cannot start pump");
+    return;
+  }
 
-  String resp = "{\"ok\":true,\"message\":\"Watering pump ";
-  resp += String(pump + 1);
-  resp += "\",\"pump\":";
-  resp += String(pump);
-  resp += ",\"durationSec\":";
-  resp += String(pumps[pump].durationSec);
-  resp += ",\"active\":true";
-  resp += ",\"watering\":";
-  resp += wateringToJson();
-  resp += ",\"lastWatered\":";
-  resp += lastWateredToJson();
-  resp += ",\"pumps\":";
-  resp += pumpsToJson();
-  resp += '}';
-  server.send(200, "application/json; charset=utf-8", resp);
+  JsonDocument response;
+  response["ok"] = true;
+  response["message"] = "Полив запущен";
+  appendStatus(response);
+
+  sendJson(200, response);
 }
 
-void handleNotFound() {
-  handleRoot();
+void handleStop() {
+  stopWatering();
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["message"] = "Полив остановлен";
+  appendStatus(response);
+
+  sendJson(200, response);
 }
 
-void printBanner(bool apOk) {
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println(" GardenESP ready");
-  Serial.println("========================================");
-  Serial.print(" Serial baud: ");
-  Serial.println(SERIAL_BAUD);
-  Serial.print(" SoftAP: ");
-  Serial.println(apOk ? "OK" : "FAILED");
-  Serial.print(" SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print(" PASS: ");
-  Serial.println(AP_PASS);
-  Serial.print(" IP:   ");
-  Serial.println(WiFi.softAPIP());
-  Serial.print(" Pumps: ");
-  Serial.println(PUMP_COUNT);
-  Serial.print(" Relay: 16-ch, ");
-  Serial.println(RELAY_ACTIVE_LOW ? "Active LOW" : "Active HIGH");
-  Serial.println(" Pins IN1..IN16:");
-  for (uint8_t i = 0; i < PUMP_COUNT; i++) {
-    Serial.print("  IN");
-    Serial.print(i + 1);
-    Serial.print("=GPIO");
-    Serial.print(RELAY_PINS[i]);
-    Serial.print((i % 4 == 3) ? "\n" : " ");
-  }
-  Serial.println(" Schedule: auto by dueInSec + NVS");
-  Serial.println(" Open in browser:");
-  Serial.println("   http://192.168.4.1");
-  Serial.println(" (use http, not https)");
-  Serial.println("========================================");
-  Serial.println();
-}
+// -------------------- Setup --------------------
 
 void setup() {
-  // Set relay outputs OFF as early as application code permits.
-  // This does not prevent transient states during ESP32 reset/boot.
-  initRelays();
-  Serial.begin(SERIAL_BAUD);
-  delay(500);
-  while (Serial.available()) {
-    Serial.read();
-  }
-  Serial.println();
-  Serial.println();
-  Serial.println("[boot] GardenESP starting...");
-  Serial.print("[boot] Set Serial Monitor baud to ");
-  Serial.println(SERIAL_BAUD);
+  // ==========================================
+  // 1. Инициализация реле
+  // ==========================================
 
-  initPumpsDefaults();
-  prefs.begin("garden", false);
-  loadStateFromNvs();
+  // Все 16 реле переводим в выключенное состояние
+  // согласно проверенной логике Active LOW.
+  initRelays();
+
+  // ==========================================
+  // 2. Serial Monitor
+  // ==========================================
+
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println();
+  Serial.println("==========================");
+  Serial.println("GardenESP starting...");
+  Serial.println("==========================");
+
+  // ==========================================
+  // 3. Загрузка сохранённых настроек
+  // ==========================================
+
+  preferences.begin("garden", false);
+  loadConfig();
+
+  Serial.println("[config] Settings loaded");
+
+  // ==========================================
+  // 4. Запуск Wi-Fi Access Point
+  // ==========================================
 
   WiFi.persistent(false);
+
   WiFi.mode(WIFI_OFF);
   delay(100);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-  bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
-  delay(100);
 
+  WiFi.mode(WIFI_AP);
+
+  // Фиксированный IP ESP32
+  WiFi.softAPConfig(
+    AP_IP,
+    AP_IP,
+    AP_MASK
+  );
+
+  bool apStarted = WiFi.softAP(
+    AP_SSID,
+    AP_PASS
+  );
+
+  // ==========================================
+  // 5. Captive Portal DNS
+  // ==========================================
+
+  // Перенаправление DNS-запросов на ESP32
   dnsServer.start(53, "*", AP_IP);
 
+  // ==========================================
+  // 6. Главная веб-страница
+  // ==========================================
+
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/config", HTTP_POST, handleConfig);
-  server.on("/api/water", HTTP_POST, handleWater);
-  server.on("/generate_204", HTTP_GET, handleRoot);
-  server.on("/gen_204", HTTP_GET, handleRoot);
-  server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
-  server.on("/connecttest.txt", HTTP_GET, handleRoot);
-  server.on("/ncsi.txt", HTTP_GET, handleRoot);
-  server.onNotFound(handleNotFound);
+
+  // ==========================================
+  // 7. API управления поливом
+  // ==========================================
+
+  server.on(
+    "/api/status",
+    HTTP_GET,
+    handleStatus
+  );
+
+  server.on(
+    "/api/config",
+    HTTP_POST,
+    handleConfig
+  );
+
+  server.on(
+    "/api/water",
+    HTTP_POST,
+    handleWater
+  );
+
+  server.on(
+    "/api/stop",
+    HTTP_POST,
+    handleStop
+  );
+
+  // ==========================================
+  // 8. Captive Portal для Android
+  // ==========================================
+
+  server.on(
+    "/generate_204",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  server.on(
+    "/gen_204",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  // ==========================================
+  // 9. Captive Portal для Apple
+  // ==========================================
+
+  server.on(
+    "/hotspot-detect.html",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  // ==========================================
+  // 10. Captive Portal для Windows
+  // ==========================================
+
+  server.on(
+    "/connecttest.txt",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  server.on(
+    "/ncsi.txt",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  server.on(
+    "/fwlink",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  // ==========================================
+  // 11. Дополнительные адреса
+  // ==========================================
+
+  server.on(
+    "/redirect",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  server.on(
+    "/canonical.html",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  server.on(
+    "/success.txt",
+    HTTP_GET,
+    handleCaptivePortal
+  );
+
+  // Любые неизвестные HTTP-запросы
+  // перенаправляем на главную страницу.
+  server.onNotFound(handleCaptivePortal);
+
+  // ==========================================
+  // 12. Запуск веб-сервера
+  // ==========================================
+
   server.begin();
 
-  lastTickMs = millis();
-  printBanner(apOk);
+  // ==========================================
+  // 13. Диагностическая информация
+  // ==========================================
+
+  Serial.println();
+  Serial.println("--------------------------");
+  Serial.println("GardenESP ready");
+
+  Serial.print("WiFi SSID: ");
+  Serial.println(AP_SSID);
+
+  Serial.print("AP started: ");
+  Serial.println(apStarted ? "YES" : "NO");
+
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println("Captive Portal: enabled");
+  Serial.println("--------------------------");
+
+  // ==========================================
+  // 14. Финальная проверка реле
+  // ==========================================
+
+  allRelaysOff();
 }
 
+// -------------------- Loop --------------------
+
 void loop() {
+  // Первым делом контролируем время полива
+  updateWatering();
+
   dnsServer.processNextRequest();
   server.handleClient();
+
+  // Повторная проверка после обработки HTTP
   updateWatering();
-  updateScheduleTick();
+
+  delay(1);
 }
